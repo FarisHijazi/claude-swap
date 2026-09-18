@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,7 +21,9 @@ from claude_swap.exceptions import (
     CredentialReadError,
     TransferError,
 )
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform, get_timestamp, normalize_alias
+from claude_swap.oauth import credential_fingerprint
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -95,18 +97,36 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
 
 
 def _atomic_write_file(path: Path, content: str) -> None:
-    """Write text atomically with 0600 perms — same pattern as switcher._write_json."""
+    """Write text atomically with 0600 perms, never exposing plaintext content
+    at a world-readable mode.
+
+    Uses ``tempfile.mkstemp`` (0600 from creation, per the process umask being
+    irrelevant to it) rather than ``Path.write_text`` + a follow-up ``chmod``:
+    the export payload carries live OAuth refresh tokens, and a write-then-
+    chmod sequence leaves the temp file at the umask-derived default mode
+    (typically world-readable) for the window between creation and the chmod
+    call. Same pattern as ``credentials.py``/``settings.py``/``migrations.py``.
+    """
     if path.is_dir():
         raise TransferError(
             f"export destination must be a file path, not a directory: {path}"
         )
-    temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-    temp_path.write_text(content, encoding="utf-8")
-    if sys.platform != "win32":
-        os.chmod(temp_path, 0o600)
-    shutil.move(str(temp_path), str(path))
-    if sys.platform != "win32":
-        os.chmod(path, 0o600)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        os.write(fd, content.encode("utf-8"))
+        os.close(fd)
+        fd = -1
+        replace_with_retry(tmp_path, str(path))
+        if sys.platform != "win32":
+            os.chmod(str(path), 0o600)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _slim_config(config_obj: dict, label: str) -> dict:
@@ -457,11 +477,22 @@ def import_accounts(
         if existing_slot is not None:
             if force:
                 outcome = "overwrote"
-            elif (
-                switcher._usage_store.entries(
+                # Snapshot the row before the write path's clear_dead_token
+                # wipes it, so the "Overwrote" print can say the strike was
+                # lifted. Silence here is how issue #218 read a lifted-then-
+                # honestly-re-condemned strike as a clear that never happened.
+                # Identity-guarded: a foreign row reads blank, so only this
+                # account's own verdict narrates.
+                row = switcher._usage_store.entries(
                     {existing_slot: (entry["email"], entry["org_uuid"])}
-                )[existing_slot].token_dead()
-            ):
+                )[existing_slot]
+                had_strike = row.auth_dead_strikes > 0
+                same_generation = (
+                    row.struck_fingerprint is not None
+                    and credential_fingerprint(entry["creds_text"])
+                    == row.struck_fingerprint
+                )
+            elif switcher._slot_token_dead(existing_slot, entry["email"]):
                 # Narrow auto-heal (issue #136): a plain import replaces a
                 # slot iff its identity-matched usage row is quarantined as
                 # refresh-token-dead. The verdict normally postdates the
@@ -546,6 +577,22 @@ def import_accounts(
 
         if outcome == "overwrote":
             _eprint(f"Overwrote {entry['email']} (slot {target_num})")
+            if had_strike:
+                # Store-fact wording on purpose: import rewrites the backup,
+                # so for the active slot the next poll may still exercise the
+                # live credentials — promise only what actually happened.
+                _eprint("  └ cleared this slot's stored dead-token strike")
+                if same_generation:
+                    # "credential generation" / "permanent auth failure", not
+                    # "refresh-token generation" / "invalid_grant": strikes
+                    # also come from no_refresh_token, where the condemned
+                    # blob has no refresh token and fingerprints by content.
+                    _eprint(
+                        "  └ this import holds the same credential "
+                        "generation the strike condemned; another permanent "
+                        "auth failure will quarantine it again — recover "
+                        "with a newer export or a re-login"
+                    )
             overwritten += 1
         elif outcome == "replaced":
             # Describe the observed trigger (the quarantine verdict), not the

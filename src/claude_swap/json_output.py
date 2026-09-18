@@ -32,6 +32,14 @@ USAGE_KEYCHAIN_UNAVAILABLE = "keychain unavailable"
 # replaces the credential; distinct from "token expired" (which Claude Code can
 # refresh on its own) because only the user can fix it.
 USAGE_RELOGIN_REQUIRED = "re-login needed"
+# The profile oracle proved the live credential belongs to a DIFFERENT account
+# than the slot's identity (foreign credential under a stale config — partial
+# cross-machine sync or a mid-``/login`` poll). Its quota is not this slot's, so
+# recording it would poison history and autoswitch decisions; distinct from
+# "token expired" because holding is wrong here — a switch repairs the drift
+# (stash the foreign credential, restore the slot's backup), so autoswitch
+# should treat the active as unknown-headroom and fail over.
+USAGE_FOREIGN_CREDENTIAL = "foreign credential"
 
 
 def _window_to_json(entry: dict) -> dict:
@@ -130,9 +138,14 @@ def usage_fields(
     """Map a collected usage entry to ``(usageStatus, usage|None)``.
 
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
-    (active token expired while Claude Code owns it), the ``USAGE_API_KEY`` sentinel
+    (active token expired and the refresh was deferred this pass — lock
+    contention, unattributable lineage, or a failed persist; retried
+    automatically — or a live session's credential refused, which only that
+    session may renew), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
+    ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to
+    another account; usage suppressed, a switch repairs the drift), the
     ``USAGE_NO_CREDENTIALS`` sentinel, or ``None`` (fetch failed). ``fetched_at``
     is forwarded to ``usage_to_json`` for the weekly pace fields (issue #125).
     """
@@ -146,6 +159,8 @@ def usage_fields(
         return "keychain_unavailable", None
     if entry == USAGE_RELOGIN_REQUIRED:
         return "relogin_required", None
+    if entry == USAGE_FOREIGN_CREDENTIAL:
+        return "foreign_credential", None
     if isinstance(entry, str):
         return "no_credentials", None
     return "unavailable", None
@@ -161,19 +176,55 @@ def usage_freshness_fields(
 ) -> dict:
     """Additive ``usageFetchedAt``/``usageAgeSeconds`` fields describing how
     old the served ``usage`` measurement is (the store may serve last-good
-    data on fetch failure). Emitted only alongside a non-null ``usage``."""
+    data on fetch failure). Emitted under these names only alongside a
+    non-null ``usage``; ``last_good_usage_fields`` reuses them renamed to
+    ``lastGoodFetchedAt``/``lastGoodAgeSeconds`` for null-``usage`` rows."""
     if fetched_at is None:
         return {}
-    fields: dict = {
-        "usageFetchedAt": (
-            datetime.fromtimestamp(fetched_at, tz=timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
-        )
-    }
+    fields: dict = {"usageFetchedAt": _timestamp(fetched_at)}
     if age_s is not None:
         fields["usageAgeSeconds"] = round(age_s, 1)
     return fields
+
+
+def _timestamp(epoch_s: float) -> str:
+    return (
+        datetime.fromtimestamp(epoch_s, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def usage_failure_fields(
+    status: str, last_error: str | None, backoff_until: float | None
+) -> dict:
+    """Additive ``usageError``/``usageRetryAt`` fields for a row that is
+    ``unavailable`` with nothing else to say for itself: the last fetch
+    failure by kind (``http-429``, ``timeout``, ...) and, while the store is
+    backing off from it, when the next attempt is due. Every other status
+    already explains the null ``usage``, so nothing is added to it."""
+    if status != "unavailable" or not last_error:
+        return {}
+    out = {"usageError": last_error}
+    if backoff_until is not None:
+        out["usageRetryAt"] = _timestamp(backoff_until)
+    return out
+
+
+def last_good_usage_fields(
+    usage: dict | None, fetched_at: float | None, age_s: float | None
+) -> dict:
+    """Display-grade last-good usage, separate from decision-grade ``usage``."""
+    if not isinstance(usage, dict) or fetched_at is None:
+        return {}
+    freshness = usage_freshness_fields(fetched_at, age_s)
+    out = {
+        "lastGoodUsage": usage_to_json(usage, fetched_at),
+        "lastGoodFetchedAt": freshness["usageFetchedAt"],
+    }
+    if "usageAgeSeconds" in freshness:
+        out["lastGoodAgeSeconds"] = freshness["usageAgeSeconds"]
+    return out
 
 
 def account_row(
@@ -186,10 +237,15 @@ def account_row(
     *,
     usage_fetched_at: float | None = None,
     usage_age_s: float | None = None,
+    last_good_usage: dict | None = None,
+    last_error: str | None = None,
+    backoff_until: float | None = None,
     alias: str = "",
     disabled: bool = False,
+    login_expires_at: str | None = None,
 ) -> dict:
-    """A full account row for ``--list``."""
+    """A full account row for ``--list``. ``backoff_until`` is the live
+    backoff only; a lapsed one is the caller's to withhold."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
@@ -207,8 +263,20 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Additive field: when the stored login records the expiry of its refresh
+    # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
+    # ``relogin_required`` that follows; absent when the login carries none.
+    if login_expires_at:
+        row["loginExpiresAt"] = login_expires_at
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
+    else:
+        row.update(
+            last_good_usage_fields(
+                last_good_usage, usage_fetched_at, usage_age_s
+            )
+        )
+        row.update(usage_failure_fields(status, last_error, backoff_until))
     return row
 
 

@@ -8,6 +8,7 @@ flows) — no scraping, no real credentials, no network.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import sys
@@ -92,6 +93,20 @@ def make_account(
         usage=entry if entry is not None else make_entry(),
         alias=alias,
         disabled=disabled,
+    )
+
+
+def make_usage_at(
+    fetched_at: float | None,
+    pct: float = 25.0,
+    *,
+    sentinel: str | None = None,
+) -> UsageEntry:
+    return UsageEntry(
+        sentinel=sentinel,
+        last_good={"five_hour": {"pct": pct, "resets_at": _iso_in(7200)}},
+        fetched_at=fetched_at,
+        age_s=(time.time() - fetched_at) if fetched_at is not None else None,
     )
 
 
@@ -183,6 +198,46 @@ class FakeSwitcher:
         self._poll_inputs_override = None
 
 
+class BlockingSnapshotSwitcher(FakeSwitcher):
+    """Fake switcher with independently gated normal/store snapshot lanes."""
+
+    def __init__(
+        self,
+        normal_account: AccountSnapshot,
+        store_account: AccountSnapshot,
+        backup_dir: Path,
+    ):
+        super().__init__([normal_account], backup_dir)
+        self.normal_account = normal_account
+        self.store_account = store_account
+        self.normal_started = threading.Event()
+        self.normal_release = threading.Event()
+        self.normal_done = threading.Event()
+        self.store_started = threading.Event()
+        self.store_release = threading.Event()
+        self.store_done = threading.Event()
+        self.block_store = False
+
+    def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
+        self.fetch_sets.append(fetch)
+        if fetch is None:
+            self.normal_started.set()
+            self.normal_release.wait(timeout=2)
+            self.normal_done.set()
+            account = self.normal_account
+        else:
+            self.store_started.set()
+            if self.block_store:
+                self.store_release.wait(timeout=2)
+            self.store_done.set()
+            account = self.store_account
+        return AccountsSnapshot(
+            active_number=account.number,
+            accounts=(account,),
+            taken_at=time.time(),
+        )
+
+
 def make_app(fake: FakeSwitcher):
     from claude_swap.tui.app import CswapApp
 
@@ -201,6 +256,10 @@ async def settle(pilot) -> None:
         await app.workers.wait_for_complete(pending)
     await pilot.pause()
     await pilot.pause()
+
+
+async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
+    assert await asyncio.to_thread(event.wait, timeout)
 
 
 async def menu_select(pilot, action_id: str) -> None:
@@ -245,7 +304,7 @@ class TestFormatting:
         # active account, not that the user must re-login.
         assert (
             tui_data.sentinel_label(USAGE_TOKEN_EXPIRED)
-            == "token expired — Claude Code refreshes the active account"
+            == "token expired — refresh deferred this pass; retries automatically"
         )
         from claude_swap.switcher import SENTINEL_NOTES
 
@@ -266,7 +325,7 @@ class TestFormatting:
             age_s=720.0,
         )
         card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
-        assert "token expired — Claude Code refreshes the active account" in card
+        assert "token expired — refresh deferred this pass; retries automatically" in card
         assert "last seen 53% used" in card
 
         no_history = account_card_text(
@@ -337,7 +396,7 @@ class TestSnapshotSource:
         # Pacing lives in the usage store (poll plans + freshness + atomic
         # reservation), so every take is the same on-demand pass `cswap list`
         # runs — including the user's explicit refresh, which cannot bypass
-        # the store's per-token cadence.
+        # the store's per-account cadence.
         fake, source = self._source(tmp_path)
         source.take()
         source.take()
@@ -348,6 +407,87 @@ class TestSnapshotSource:
         fake, source = self._source(tmp_path)
         source.take(store_only=True)
         assert fake.fetch_sets == [set()]
+
+    def test_expired_sentinel_retained_until_fetched_at_advances(self, tmp_path):
+        expired = make_account(
+            1,
+            active=True,
+            entry=make_usage_at(100.0, sentinel=USAGE_TOKEN_EXPIRED),
+        )
+        fresh_same_stamp = make_account(1, active=True, entry=make_usage_at(100.0))
+        fresh_new_stamp = make_account(1, active=True, entry=make_usage_at(101.0))
+        fake, source = self._source(tmp_path, [expired])
+
+        assert source.take().accounts[0].usage.sentinel == USAGE_TOKEN_EXPIRED
+        fake._accounts = [fresh_same_stamp]
+        assert source.take(store_only=True).accounts[0].usage.sentinel == USAGE_TOKEN_EXPIRED
+        fake._accounts = [fresh_new_stamp]
+        assert source.take(store_only=True).accounts[0].usage.sentinel is None
+
+    def test_expired_sentinel_clears_on_superseding_sentinel(self, tmp_path):
+        expired = make_account(
+            1,
+            active=True,
+            entry=make_usage_at(100.0, sentinel=USAGE_TOKEN_EXPIRED),
+        )
+        api_key = make_account(
+            1,
+            active=True,
+            kind="api_key",
+            entry=make_usage_at(None, sentinel=USAGE_API_KEY),
+        )
+        fake, source = self._source(tmp_path, [expired])
+
+        source.take()
+        fake._accounts = [api_key]
+        assert source.take(store_only=True).accounts[0].usage.sentinel == USAGE_API_KEY
+
+    def test_expired_sentinel_clears_on_identity_replacement(self, tmp_path):
+        expired = make_account(
+            1,
+            active=True,
+            email="old@example.com",
+            entry=make_usage_at(100.0, sentinel=USAGE_TOKEN_EXPIRED),
+        )
+        replacement = make_account(
+            1,
+            active=True,
+            email="new@example.com",
+            entry=make_usage_at(100.0),
+        )
+        fake, source = self._source(tmp_path, [expired])
+
+        source.take()
+        fake._accounts = [replacement]
+        assert source.take(store_only=True).accounts[0].usage.sentinel is None
+
+    def test_late_worker_fetched_at_regression_is_rejected(self, tmp_path):
+        newer = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
+        older = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
+        fake, source = self._source(tmp_path, [newer])
+
+        source.take()
+        fake._accounts = [older]
+        snap = source.take(store_only=True)
+        usage = snap.accounts[0].usage
+        assert usage.fetched_at == 200.0
+        assert usage.last_good["five_hour"]["pct"] == 80.0
+
+    def test_late_expired_sentinel_cannot_replace_newer_usage(self, tmp_path):
+        newer = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
+        older = make_account(
+            1,
+            active=True,
+            entry=make_usage_at(100.0, pct=10.0, sentinel=USAGE_TOKEN_EXPIRED),
+        )
+        fake, source = self._source(tmp_path, [newer])
+
+        source.take()
+        fake._accounts = [older]
+        usage = source.take(store_only=True).accounts[0].usage
+        assert usage.sentinel is None
+        assert usage.fetched_at == 200.0
+        assert usage.last_good["five_hour"]["pct"] == 80.0
 
 
 class TestUsageRows:
@@ -1045,6 +1185,97 @@ class TestWatchScreen:
             await pilot.press("escape")
             await pilot.pause()
             assert isinstance(app.screen, DashboardScreen)
+
+    async def test_blocked_normal_allows_store_only_repaint_without_stale_overpaint(
+        self, tmp_path
+    ):
+        normal = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
+        store = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
+        fake = BlockingSnapshotSwitcher(normal, store, tmp_path)
+        app = make_app(fake)
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            await wait_event(fake.normal_started)
+            app._tick()
+            await wait_event(fake.store_done)
+            await pilot.pause()
+            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 80.0
+
+            fake.normal_release.set()
+            await wait_event(fake.normal_done)
+            await pilot.pause()
+            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 80.0
+            assert fake.fetch_sets == [None, set()]
+
+    async def test_late_normal_can_advance_usage_after_store_repaint(self, tmp_path):
+        normal = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
+        store = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
+        fake = BlockingSnapshotSwitcher(normal, store, tmp_path)
+        app = make_app(fake)
+
+        async with app.run_test(size=(100, 40)) as pilot:
+            await wait_event(fake.normal_started)
+            app._tick()
+            await wait_event(fake.store_done)
+            await pilot.pause()
+            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 10.0
+
+            fake.normal_release.set()
+            await wait_event(fake.normal_done)
+            await pilot.pause()
+            assert app.snapshot.accounts[0].usage.last_good["five_hour"]["pct"] == 80.0
+
+    async def test_repeated_ticks_keep_store_lane_single_flight(self, tmp_path):
+        normal = make_account(1, active=True, entry=make_usage_at(100.0, pct=10.0))
+        store = make_account(1, active=True, entry=make_usage_at(200.0, pct=80.0))
+        fake = BlockingSnapshotSwitcher(normal, store, tmp_path)
+        fake.block_store = True
+        app = make_app(fake)
+
+        async with app.run_test(size=(100, 40)):
+            await wait_event(fake.normal_started)
+            app._tick()
+            await wait_event(fake.store_started)
+            app._tick()
+            app._tick()
+            assert fake.fetch_sets == [None, set()]
+            fake.store_release.set()
+            fake.normal_release.set()
+            await wait_event(fake.store_done)
+            await wait_event(fake.normal_done)
+
+    async def test_store_only_mode_launches_only_store_lane(self, tmp_path):
+        fake = self._fake(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            fake.fetch_sets.clear()
+            app.set_store_only(True)
+            await settle(pilot)
+            assert fake.fetch_sets == [set()]
+
+    async def test_watch_title_shows_snapshot_age_and_long_refresh(self, tmp_path):
+        app = make_app(self._fake(tmp_path))
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("w")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            title = app.screen.query_one("#list-title", Static)
+            # Fresh snapshots stay quiet; the age note is a staleness alarm.
+            assert "snapshot" not in title.render().plain
+            app.snapshot = dataclasses.replace(
+                app.snapshot, taken_at=time.time() - app.SNAPSHOT_AGE_NOTE_S - 1.0
+            )
+            app._update_refresh_status()
+            await pilot.pause()
+            assert "snapshot 1m ago" in title.render().plain
+            app._normal_refreshing = True
+            app._normal_started_at = time.time() - app.POLL_INTERVAL_S - 1.0
+            app._update_refresh_status()
+            await pilot.pause()
+            assert "refreshing" in title.render().plain
 
 
 def fake_calls(app) -> list[tuple]:
