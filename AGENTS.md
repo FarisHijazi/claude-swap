@@ -1,7 +1,7 @@
 # Fork maintenance
 
 This fork retains `cswap env` and `cswap run --share-all`; see the
-[shell-pinning documentation](README.md#pin-a-whole-shell-to-an-account).
+[shell-pinning documentation](README.md#pin-a-whole-shell-to-an-account-cswap-env).
 Preserve both alongside upstream session and credential-safety changes.
 
 Run `uv sync --locked` and `uv run --locked pytest -q` before publishing changes.
