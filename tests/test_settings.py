@@ -165,7 +165,8 @@ class TestSettingSpecs:
         }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        from claude_swap.settings import UsageSettings
+        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings(), "usage": UsageSettings()}
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

@@ -2,7 +2,7 @@
 
 One versioned JSON file for user-tunable claude-swap preferences, written
 atomically with the backup dir's 0600/0700 modes. v1 carries the
-``autoswitch`` and ``ui`` sections; other sections can be added additively.
+``autoswitch``, ``ui`` and ``usage`` sections; others can be added additively.
 Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
@@ -67,7 +67,16 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class UsageSettings:
+    """Real inference probes consume a small amount of tokens/credits."""
+
+    availability_probe: bool = True
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings, "ui": UiSettings, "usage": UsageSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -138,6 +147,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        SettingSpec(
+            "usage", "availabilityProbe", "availability_probe", "bool",
+            help="Send a one-output-token Haiku availability request for API/setup keys every 120s",
         ),
     )
 }
@@ -246,6 +259,13 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         return default
     return UiSettings(theme=theme)
+
+
+def load_usage_settings(backup_root: Path) -> UsageSettings:
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("usage")
+    value = section.get("availabilityProbe") if isinstance(section, dict) else None
+    return UsageSettings(availability_probe=value if isinstance(value, bool) else True)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -412,6 +432,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "usage": load_usage_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

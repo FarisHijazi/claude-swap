@@ -73,6 +73,8 @@ from claude_swap import oauth
 # served from the store without any fetch, so the maximum sustained rate on
 # one token is 1/SERVE_TTL_S regardless of how many surfaces are open.
 SERVE_TTL_S = 180.0
+# Inference probes use a separate budget and cadence from /api/oauth/usage.
+PROBE_INTERVAL_S = 120.0
 
 # Normal cadence floor — movement can halve an interval down to this, never
 # below.

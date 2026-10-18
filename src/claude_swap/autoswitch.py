@@ -972,6 +972,15 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
+        active_probe_status = oauth.availability_status(usage.get(current))
+        if active_probe_status == "available" and not self._models:
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            self._emit(NoSwitchEvent(
+                reason="haiku-available",
+                detail="Haiku probe accepted; utilization percentage unknown",
+            ))
+            return TickOutcome.NO_ACTION
         active_headroom = headroom.get(current)
         if active_headroom is not None:
             self._unhealthy_ticks = 0
@@ -998,6 +1007,10 @@ class AutoSwitchEngine:
                 trigger = "consume-first"
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
+        elif active_probe_status in ("rate_limited", "exhausted"):
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            trigger = "at-limit"
         else:
             if usage.get(current) == USAGE_TOKEN_EXPIRED:
                 # Expired and the refresh could not complete this pass (lock
@@ -1217,11 +1230,24 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
+        if not ordered and trigger not in ("proactive", "consume-first"):
+            # Inference-only credentials have no numeric headroom to rank.
+            # Prefer measured OAuth headroom; use a successful Haiku probe
+            # only as an escape fallback, without inventing a percentage.
+            ordered = [
+                n for n in oauth_candidates
+                if oauth.availability_status(usage.get(n)) == "available"
+                and not self._models
+            ]
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
-            ordered = api_key_candidates
+            ordered = [
+                n for n in api_key_candidates
+                if oauth.availability_status(usage.get(n)) == "available"
+                and not self._models
+            ]
 
         if not ordered:
             if not any_known:

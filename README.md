@@ -70,7 +70,7 @@ cswap switch user@example.com
 cswap switch dev                # or by alias, once set with `cswap alias 2 dev`
 ```
 
-Not sure which one? `cswap list` is the dashboard — every account's 5-hour and 7-day usage and reset times at a glance:
+Not sure which one? `cswap list` is the dashboard — subscription usage and reset times, or [API/setup-key availability](#availability-checks-for-keys), at a glance:
 
 ```bash
 cswap list
@@ -100,7 +100,7 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset.
 - **Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`): `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left. `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
-- It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
+- If a subscription usage check errors it keeps trusting the last-known numbers while retries back off; key availability becomes unknown after a failed or missed probe. An expired login on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
@@ -315,6 +315,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
+cswap config set usage.availabilityProbe false  # disable paid Haiku availability checks
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
@@ -338,6 +339,21 @@ cswap import backup.cswap --force            # Overwrite existing
 The export file is plaintext JSON and, by default, carries only each account's own login — machine-shared MCP/plugin OAuth tokens and the device token stay on the source machine (`--full` keeps everything, for same-PC backups). If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
 
 If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
+
+### Share usage readings between machines
+
+Machines that hold the same accounts can end up spending one usage-endpoint budget: when they share a login (moved between them with `export`/`import`, so the same token is live on each), or when the account's usage requests are limited per account rather than per token. Their polling then adds up. `import-usage` lets one machine poll and hand its readings to the others:
+
+```bash
+cswap list --json | ssh laptop cswap import-usage - --hold 600
+```
+
+<details>
+<summary>How it works — matching, holds & when a hold ends</summary>
+
+The input is `cswap list --json` output. Each row with `usageStatus: "ok"` is matched to a local account by email and organization, and adopted when it is newer than the reading already stored. Its age comes from `usageAgeSeconds`, so the two machines' clocks never have to agree; a script that delays the hand-over should add the delay to that field. `--hold SECONDS` keeps every collector on the receiving machine (`list`, `status`, `auto`, the dashboard, the menu bar) from fetching those accounts for that long, and the held reading stays trusted for switch decisions meanwhile. A hold never runs past the reading's earliest window reset (per-model windows included), nor past an hour after the reading was taken. Renew it with each hand-over, or lift it early with `--hold 0`; when it lapses, the machine goes back to fetching for itself.
+
+</details>
 
 ### JSON output for scripting
 
@@ -382,26 +398,66 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)
-or a managed API key (`sk-ant-api...`) and you don't want to log in via the browser
+or a Console API key (`sk-ant-api03-...` workspace key, `sk-ant-usr-...` personal
+key, or a service-account key) and you don't want to log in via the browser
 flow first — useful on headless servers or when receiving a token from another
 machine — register it directly. The token type is auto-detected:
 
 ```bash
 cswap add-token sk-ant-oat01-...             # OAuth setup-token
-cswap add-token sk-ant-api03-...             # managed API key
+cswap add-token sk-ant-api03-...             # API key (any Console key family)
 cswap add-token sk-ant-oat01-... --slot 3
 cswap add-token - --slot 3                   # read token from stdin
 cswap add-token --email user@example.com     # optional label override
 ```
 
 `--email` is optional; omitted values use `setup-token-{slot}@token.local`
-(or `api-key-{slot}@token.local` for API keys). No Anthropic API calls are made.
+(or `api-key-{slot}@token.local` for API keys). Registration itself makes no
+Anthropic API calls; later usage collection runs the availability checks below.
 
-**API-key accounts.** An `sk-ant-api...` value registers a managed API-key account
-(the kind Claude Code uses after `/login` with a key) rather than an OAuth
-setup-token. It switches like any other account; since API keys have no subscription
-quota, they show no usage and the usage-aware `switch` strategies never skip them as
-rate-limited.
+**API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token
+(`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses
+after `/login` with a key) rather than an OAuth setup-token. It switches like any
+other account; they report availability without a quota percentage. `next-available`
+skips keys whose latest probe was blocked. Automatic switching onto metered API keys
+still requires `--include-api-key-accounts` and a fresh successful probe. Create personal and
+service-account keys scoped to a single workspace: a multi-workspace key needs an
+`anthropic-workspace-id` header on every request, which Claude Code does not add for
+a stored key.
+
+### Availability checks for keys
+
+API keys and inference-only OAuth setup-tokens cannot read subscription usage
+percentages. While `cswap`, `cswap watch`, or `cswap auto` is running, cswap sends
+a real Haiku request per eligible account about every **120 seconds**, with a
+single-character prompt and `max_tokens: 1`. API keys use only that prompt;
+OAuth requests also need Claude Code's identifying system prompt. Each request
+consumes input tokens and up to one output token from the account's credits or
+subscription allowance. One-shot `list`/`status` commands check only when due;
+they do not start a background service.
+
+The CLI, TUI and menu bar show **Haiku available**, **Haiku rate limited**, or
+**API credits exhausted**, without inventing a percentage. A 429 can reflect a
+temporary request/token rate limit; only an explicit insufficient-credit error
+is shown as exhausted. Authentication, model-access and network failures mean
+availability is unknown. A successful Haiku request does not prove that an Opus,
+Sonnet or other model-specific quota has capacity. Normal browser logins retain
+the existing subscription usage endpoint and its adaptive polling cadence.
+
+All collectors share the existing disk cache, fetch leases and poll plans, so
+opening several dashboards on one machine does not multiply requests. Server
+`Retry-After` extends the next check; failed requests back off for at least two
+minutes. Binary observations stop being actionable after two minutes or any
+later fetch error, even when a last-good observation remains in history.
+Disable probes with `cswap config set usage.availabilityProbe false`; enable
+them again with `cswap config set usage.availabilityProbe true`.
+
+JSON represents these observations as `usage.availability`, containing `status`
+(`available`, `rate_limited` or `exhausted`), `model`, and `source: "haiku_probe"`,
+plus `retryAfterSeconds` when supplied. Existing freshness/error fields still
+apply. Available setup-tokens are an automatic failover fallback after accounts
+with measured headroom; they are not ranked by a fictitious utilization and are
+not used for configured per-model quota comparisons.
 
 ## Uninstall
 

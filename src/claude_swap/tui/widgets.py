@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ERROR_NOTES
@@ -203,6 +203,12 @@ def account_card_text(
                 text.append(f"└ {last_seen}", style=palette.muted)
         return text
 
+    if oauth.availability_status(acc.usage.last_good):
+        label = oauth.availability_label(acc.usage.decision_value()) or "Haiku availability unknown"
+        text.append(f"\n    {label}", style=palette.muted)
+        if acc.usage.last_error:
+            text.append(f" · {ERROR_NOTES.get(acc.usage.last_error, acc.usage.last_error)}", style=palette.muted)
+        return text
     rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
     if not rows:
         text.append("\n    ")
@@ -269,6 +275,10 @@ def mini_account_text(
         return text
 
     last_good = acc.usage.last_good
+    if oauth.availability_status(last_good):
+        label = oauth.availability_label(acc.usage.decision_value()) or "Haiku availability unknown"
+        text.append(label, style=palette.muted)
+        return text
     fetched_at = acc.usage.fetched_at
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     parts = 0

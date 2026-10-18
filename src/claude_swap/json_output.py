@@ -8,6 +8,7 @@ the single ``json.dumps`` (see cli.py).
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 from claude_swap import oauth, pace
@@ -20,9 +21,10 @@ SCHEMA_VERSION = 1
 # JSON projection agree instead of scattering raw strings.
 USAGE_NO_CREDENTIALS = "no credentials"
 USAGE_TOKEN_EXPIRED = "token expired"
-# API-key (``/login`` managed key) accounts have no subscription quota; usage is
-# reported as this sentinel instead of being fetched from the OAuth usage API.
+# Legacy API-key sentinel retained for JSON/import compatibility. Current
+# collectors record binary Haiku availability instead of numeric quota.
 USAGE_API_KEY = "api key"
+USAGE_PROBE_DISABLED = "availability probe disabled"
 # The active account's macOS Keychain was unreadable (locked / denied / timeout)
 # with no plaintext fallback — distinct from a genuinely empty slot, so the user
 # isn't misled into an unnecessary re-login.
@@ -109,6 +111,8 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
     windows (``seven_day``, ``scoped``) only — never ``five_hour`` (issue #125).
     """
     out: dict = {}
+    if oauth.availability_status(usage):
+        out["availability"] = dict(usage["availability"])
     if "five_hour" in usage:
         out["fiveHour"] = _window_to_json(usage["five_hour"])
     if "seven_day" in usage:
@@ -129,6 +133,97 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    return out
+
+
+def _is_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _window_from_json(window: object, label: str) -> dict:
+    """One JSON window back to the internal shape, fetch-time strings rebuilt."""
+    if not isinstance(window, dict):
+        raise ValueError(f"{label} must be an object")
+    pct = window.get("pct")
+    if not _is_number(pct) or pct < 0:
+        raise ValueError(f"{label}.pct must be a non-negative number")
+    out: dict = {"pct": float(pct)}
+    resets_at = window.get("resetsAt")
+    if resets_at is not None:
+        if not isinstance(resets_at, str):
+            raise ValueError(f"{label}.resetsAt must be an ISO-8601 string")
+        try:
+            out["countdown"], out["clock"] = oauth.format_reset(resets_at)
+        except (ValueError, TypeError):
+            raise ValueError(f"{label}.resetsAt is not an ISO-8601 time: {resets_at!r}")
+        out["resets_at"] = resets_at
+    return out
+
+
+def usage_from_json(usage: object) -> dict:
+    """Read a ``usage`` object from ``list --json`` back into the internal dict.
+
+    The inverse of :func:`usage_to_json` for what the API measured: ``pct``,
+    ``resetsAt``, the spend amounts and the scoped model names. Everything
+    derived at serialization (countdown, clock, pace fields) is dropped, and
+    the fetch-time strings are rebuilt from ``resets_at``, which gives the
+    shape :func:`oauth.build_usage_result` stores. Raises ``ValueError`` on
+    anything malformed, so an importer can refuse a document before writing
+    any of it.
+    """
+    if not isinstance(usage, dict):
+        raise ValueError("usage must be an object")
+    out: dict = {}
+    if "availability" in usage:
+        availability = usage["availability"]
+        if (
+            not isinstance(availability, dict)
+            or availability.get("status") not in {"available", "rate_limited", "exhausted"}
+            or not isinstance(availability.get("model"), str)
+            or availability.get("source") != "haiku_probe"
+        ):
+            raise ValueError("availability must be a Haiku probe observation")
+        out["availability"] = {
+            key: availability[key] for key in ("status", "model", "source")
+        }
+        if "retryAfterSeconds" in availability:
+            retry = availability["retryAfterSeconds"]
+            if not _is_number(retry) or retry < 0:
+                raise ValueError("availability.retryAfterSeconds must be non-negative")
+            out["availability"]["retryAfterSeconds"] = float(retry)
+    if "fiveHour" in usage:
+        out["five_hour"] = _window_from_json(usage["fiveHour"], "fiveHour")
+    if "sevenDay" in usage:
+        out["seven_day"] = _window_from_json(usage["sevenDay"], "sevenDay")
+    if "spend" in usage:
+        spend = usage["spend"]
+        out_spend = _window_from_json(spend, "spend")
+        for key in ("used", "limit"):
+            if not _is_number(spend.get(key)):
+                raise ValueError(f"spend.{key} must be a number")
+            out_spend[key] = float(spend[key])
+        if not isinstance(spend.get("currency"), str):
+            raise ValueError("spend.currency must be a string")
+        out_spend["currency"] = spend["currency"]
+        out["spend"] = out_spend
+    if "scoped" in usage:
+        if not isinstance(usage["scoped"], list):
+            raise ValueError("scoped must be a list")
+        scoped = []
+        for i, window in enumerate(usage["scoped"]):
+            label = f"scoped[{i}]"
+            entry = _window_from_json(window, label)
+            name = window.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{label}.name must be a non-empty string")
+            scoped.append({"name": name, **entry})
+        out["scoped"] = scoped
+    if not out:
+        raise ValueError("usage carries no windows")
     return out
 
 
@@ -155,6 +250,8 @@ def usage_fields(
         return "token_expired", None
     if entry == USAGE_API_KEY:
         return "api_key", None
+    if entry == USAGE_PROBE_DISABLED:
+        return "probe_disabled", None
     if entry == USAGE_KEYCHAIN_UNAVAILABLE:
         return "keychain_unavailable", None
     if entry == USAGE_RELOGIN_REQUIRED:

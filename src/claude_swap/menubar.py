@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import pace
+from claude_swap import oauth, pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import warning
 from claude_swap.switcher import SENTINEL_NOTES
@@ -397,6 +397,8 @@ def _account_display_usage(entry) -> dict | str | None:
     """
     if entry.sentinel:
         return SENTINEL_NOTES.get(entry.sentinel, entry.sentinel)
+    if oauth.availability_status(entry.last_good):
+        return oauth.availability_label(entry.decision_value()) or "Haiku availability unknown"
     return entry.last_good
 
 

@@ -902,11 +902,11 @@ class TestClassifyUsageError:
         assert kind == "http-429"
         assert retry == 30.0
 
-    def test_retry_after_date_form_ignored(self):
+    def test_retry_after_past_date_clamped(self):
         _, retry = oauth._classify_usage_error(
             self._http_error(429, {"Retry-After": "Fri, 04 Jul 2026 12:00:00 GMT"})
         )
-        assert retry is None
+        assert retry == 0.0
 
     def test_retry_after_negative_clamped(self):
         _, retry = oauth._classify_usage_error(

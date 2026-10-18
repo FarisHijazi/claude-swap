@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 from claude_swap.printer import warning as print_warning
 
@@ -18,6 +20,11 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+USAGE_PROBE_MODEL = "claude-haiku-4-5-20251001"
+USAGE_PROBE_URL = "https://api.anthropic.com/v1/messages"
+# Required for OAuth inference; follows upstream PR #412's verified request.
+USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 
 _logger = logging.getLogger("claude-swap")
 
@@ -413,17 +420,21 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     ``kind`` is a short stable token for logs and backoff decisions
     (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
     exception type name as a fallback). ``retry_after_s`` is the parsed
-    ``Retry-After`` header when the server sent one (seconds form only — the
-    HTTP-date form is rare enough to ignore).
+    ``Retry-After`` header in seconds or HTTP-date form.
     """
     if isinstance(e, urllib.error.HTTPError):
         retry_after = None
         raw = e.headers.get("Retry-After") if e.headers else None
         if raw:
             try:
-                retry_after = max(0.0, float(raw.strip()))
+                seconds = float(raw.strip())
+                retry_after = max(0.0, seconds) if math.isfinite(seconds) else None
             except ValueError:
-                pass
+                try:
+                    deadline = parsedate_to_datetime(raw)
+                    retry_after = max(0.0, deadline.timestamp() - datetime.now(timezone.utc).timestamp())
+                except (ValueError, TypeError, OverflowError):
+                    pass
         return f"http-{e.code}", retry_after
     if isinstance(e, TimeoutError):  # socket.timeout is an alias since 3.10
         return "timeout", None
@@ -612,6 +623,103 @@ class UsageOutcome:
     # permanent auth kind — lets the store bind the strike to that
     # generation (see usage_store.FetchRecord.struck_fp).
     struck_fp: str | None = None
+
+
+def uses_availability_probe(credentials: str) -> bool:
+    """Keys and inference-only tokens cannot read subscription percentages."""
+    from claude_swap.credentials import looks_like_api_key
+
+    if looks_like_api_key(credentials):
+        return True
+    data = extract_oauth_data(credentials) or {}
+    scopes = data.get("scopes")
+    return bool(data.get("accessToken")) and (
+        scopes == ["user:inference"]
+    )
+
+
+def availability_status(usage: object) -> str | None:
+    """Binary Haiku observation, separate from numeric quota/headroom."""
+    if not isinstance(usage, dict):
+        return None
+    availability = usage.get("availability")
+    return availability.get("status") if isinstance(availability, dict) else None
+
+
+def availability_label(usage: object) -> str | None:
+    return {
+        "available": "Haiku available (percentage unknown)",
+        "rate_limited": "Haiku rate limited (percentage unknown)",
+        "exhausted": "API credits exhausted (percentage unknown)",
+    }.get(availability_status(usage))
+
+
+def try_probe_availability(credentials: str) -> UsageOutcome:
+    """One real Haiku request, at most one generated token, no token refresh.
+
+    Authentication, model access and transport errors are unknown availability.
+    A 429 observes a temporary inference limit, not a usage percentage. Only an
+    explicit insufficient-credit response proves a depleted credit balance.
+    """
+    from claude_swap.credentials import looks_like_api_key
+
+    api_key = looks_like_api_key(credentials)
+    token = credentials.strip() if api_key else extract_access_token(credentials)
+    if not token:
+        return UsageOutcome(None, error="no-access-token")
+    body = {
+        "model": USAGE_PROBE_MODEL,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "."}],
+    }
+    headers = {
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+        "User-Agent": "claude-swap/1.0",
+    }
+    if api_key:
+        headers["x-api-key"] = token
+    else:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["anthropic-beta"] = OAUTH_BETA_HEADER
+        body["system"] = USAGE_PROBE_SYSTEM
+    req = urllib.request.Request(
+        USAGE_PROBE_URL, data=json.dumps(body).encode(), headers=headers, method="POST"
+    )
+    status = "available"
+    retry_after = None
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            # Read the bounded one-token response, never persist generated text.
+            data = json.loads(response.read().decode())
+            if not isinstance(data, dict) or data.get("type") != "message":
+                return UsageOutcome(None, error="bad-response")
+    except urllib.error.HTTPError as exc:
+        kind, retry_after = _classify_usage_error(exc)
+        if exc.code == 429:
+            status = "rate_limited"
+        elif exc.code == 400:
+            try:
+                payload = json.loads(exc.read(65536).decode())
+                error = payload.get("error", {})
+                message = str(error.get("message", "")).lower()
+            except (ValueError, AttributeError, UnicodeError):
+                message = ""
+            if "credit balance is too low" in message or "insufficient credit" in message:
+                status = "exhausted"
+            else:
+                return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+        else:
+            return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+    except Exception as exc:
+        kind, retry_after = _classify_usage_error(exc)
+        return UsageOutcome(None, error=kind, retry_after_s=retry_after)
+    observation = {
+        "status": status, "model": USAGE_PROBE_MODEL, "source": "haiku_probe",
+    }
+    if retry_after is not None and math.isfinite(retry_after):
+        observation["retryAfterSeconds"] = max(0.0, retry_after)
+    return UsageOutcome({"availability": observation})
 
 
 def fetch_usage(access_token: str) -> dict | None:
