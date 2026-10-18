@@ -5022,6 +5022,30 @@ class TestAddAccountSlot:
         assert data["accounts"]["3"]["email"] == "a@example.com"
         assert "Cancelled" in capsys.readouterr().out
 
+    def test_add_from_other_config_dir_keeps_active_slot(self, temp_home, monkeypatch):
+        """A login captured outside the default profile is stored, never made active."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home, email="a@example.com")
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        other = temp_home / "other-login"
+        other.mkdir()
+        (other / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "b@example.com", "accountUuid": "uuid-b", "organizationUuid": "",
+        }}))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_read_capture_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=2)  # new slot
+            switcher.add_account()  # in-place refresh of the same account
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == "b@example.com"
+        assert data["activeAccountNumber"] == 1
+
     def test_slot_occupied_overwrite(self, temp_home, capsys):
         """When slot is occupied and user confirms, should overwrite."""
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})

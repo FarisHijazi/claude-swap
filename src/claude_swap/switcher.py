@@ -3608,7 +3608,8 @@ class ClaudeAccountSwitcher:
             if alias is not None:
                 seq["accounts"][account_num]["alias"] = alias
 
-            seq["activeAccountNumber"] = int(account_num)
+            if self._capture_is_live_store():
+                seq["activeAccountNumber"] = int(account_num)
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
 
@@ -3763,7 +3764,8 @@ class ClaudeAccountSwitcher:
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
             data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
+        if self._capture_is_live_store():
+            data["activeAccountNumber"] = int(account_num)
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
@@ -6733,6 +6735,20 @@ class ClaudeAccountSwitcher:
         raise SwitchError(
             f"Account-{account_num} has no stored credentials. "
             f"Re-add with: cswap --add-account --slot {account_num}"
+        )
+
+    @staticmethod
+    def _capture_is_live_store() -> bool:
+        """Whether ``add`` captured the default profile, the login cswap switches.
+
+        Adding from another ``CLAUDE_CONFIG_DIR`` (a second login kept for a
+        launcher) stores that account but must not mark it active: the default
+        profile still holds a different account, and rotation anchors on
+        ``activeAccountNumber``.
+        """
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        return not config_dir or _same_directory(
+            Path(config_dir), get_default_claude_config_home()
         )
 
     def _refuse_session_shell(self) -> None:
