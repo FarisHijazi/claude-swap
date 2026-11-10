@@ -58,27 +58,21 @@ def http_error(code, *, message="request failed", retry=None):
     )
 
 
-@pytest.mark.parametrize("credentials,is_key", [(API_KEY, True), (setup_credentials(), False)])
-def test_probe_sends_one_real_minimal_haiku_request(credentials, is_key):
+def test_probe_sends_one_real_minimal_haiku_request():
     with patch.object(oauth.urllib.request, "urlopen", return_value=response()) as send:
-        outcome = oauth.try_probe_availability(credentials)
+        outcome = oauth.try_probe_availability(API_KEY)
     assert outcome.error is None
     assert outcome.usage == observation()
     request = send.call_args.args[0]
     body = json.loads(request.data)
     assert body["model"] == oauth.USAGE_PROBE_MODEL
     assert body["max_tokens"] == 1
-    assert body["messages"] == [{"role": "user", "content": "."}]
-    assert request.full_url == "https://api.anthropic.com/v1/messages"
+    assert body["messages"] == [{"role": "user", "content": "hi"}]
+    assert body["system"] == oauth.USAGE_PROBE_SYSTEM
+    assert request.full_url == oauth.USAGE_PROBE_URL
     assert request.method == "POST"
-    if is_key:
-        assert request.get_header("X-api-key") == credentials
-        assert request.get_header("Authorization") is None
-        assert "system" not in body
-    else:
-        assert request.get_header("Authorization") == "Bearer sk-ant-oat01-example"
-        assert request.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
-        assert body["system"] == oauth.USAGE_PROBE_SYSTEM
+    assert request.get_header("X-api-key") == API_KEY
+    assert request.get_header("Authorization") is None
     assert send.call_count == 1
     assert "text" not in json.dumps(outcome.usage)
     assert oauth.account_headroom(outcome.usage) is None
@@ -118,7 +112,9 @@ def test_probe_does_not_treat_non_message_200_as_available():
 
 
 @pytest.mark.parametrize("credentials,eligible", [
-    (API_KEY, True), (setup_credentials(), True),
+    (API_KEY, True),
+    # Setup-tokens read real percentages from upstream's header probe instead.
+    (setup_credentials(), False),
     (json.dumps({"claudeAiOauth": {"accessToken": "token", "refreshToken": "refresh", "scopes": ["user:profile", "user:inference"]}}), False),
     (json.dumps({"claudeAiOauth": {"accessToken": "token"}}), False),
     ("", False),
@@ -139,7 +135,7 @@ def test_collectors_share_120_second_cadence_and_never_refresh_tokens(temp_home)
     second = _linux_switcher()
     clock = FakeClock()
     first._usage_store.clock = second._usage_store.clock = clock
-    info = [(2, "user@example.com", "", "", False, setup_credentials(), "")]
+    info = [(2, "user@example.com", "", "", False, API_KEY, "")]
     with (
         patch.object(oauth, "try_probe_availability", return_value=oauth.UsageOutcome(observation())) as probe,
         patch.object(oauth, "try_fetch_usage_for_account") as usage,
@@ -280,13 +276,21 @@ def test_blocked_active_probe_fails_over_without_numeric_utilization(temp_home):
     assert harness.active_number() == 2
 
 
-def test_setup_probe_is_failover_fallback_after_measured_accounts(temp_home):
-    harness = EngineHarness(temp_home)
-    harness.seed(1, "user@example.com")
-    harness.seed(2, "work@example.com")
-    harness.make_live("user@example.com", 1)
-    assert harness.tick_with_usage({"1": _usage(100), "2": observation()}) is TickOutcome.SWITCHED
-    assert harness.active_number() == 2
+def test_setup_token_uses_header_probe_not_availability_probe(temp_home):
+    switcher = _linux_switcher()
+    info = [(2, "user@example.com", "", "", False, setup_credentials(), "")]
+    with (
+        patch.object(oauth, "try_probe_availability") as probe,
+        patch.object(switcher, "_header_probe_enabled", return_value=True),
+        patch.object(oauth, "request_usage_via_probe", return_value={
+            "five_hour": {"utilization": 12.0}, "seven_day": {"utilization": 34.0},
+        }) as header,
+    ):
+        entry = switcher._collect_usage_entries(info)["2"]
+    probe.assert_not_called()
+    header.assert_called_once()
+    assert entry.last_good["five_hour"]["pct"] == 12.0
+    assert oauth.availability_status(entry.last_good) is None
 
 
 @pytest.mark.parametrize("candidate", [observation("rate_limited"), observation("exhausted"), None])

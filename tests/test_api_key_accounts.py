@@ -295,7 +295,7 @@ class TestUsageDisplay:
         )
         usage = {"availability": {"status": "available", "model": oauth.USAGE_PROBE_MODEL, "source": "haiku_probe"}}
         with patch.object(oauth, "try_probe_availability", return_value=oauth.UsageOutcome(usage)) as probe:
-            entry = s._active_account_usage("2", "api-key-2@token.local", "")
+            entry, _login_expires_at = s._active_account_usage("2", "api-key-2@token.local", "")
         probe.assert_called_once_with(key)
         assert entry.sentinel is None
         assert entry.decision_value() == usage
@@ -876,7 +876,7 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         def no_space(*_a, **_kw):
             raise OSError(28, "No space left on device")
 
-        with patch("claude_swap.switcher.shutil.copy", side_effect=no_space):
+        with patch("claude_swap.switcher.atomic_write_bytes", side_effect=no_space):
             with pytest.raises(SwitchError):
                 s.switch_to("2", json_output=True)
 
